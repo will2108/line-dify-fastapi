@@ -14,9 +14,31 @@ def health():
 @app.post("/line/webhook")
 async def line_webhook(request: Request):
     body = await request.json()
+    print("LINE payload:", body)
 
-    user_message = body["events"][0]["message"]["text"]
-    user_id = body["events"][0]["source"]["userId"]
+    events = body.get("events", [])
+    if not events:
+        # 沒事件也要回 200
+        return {"status": "ok"}
+
+    event = events[0]
+
+    # 不是 message（例如 Verify webhook）
+    if event.get("type") != "message":
+        return {"status": "ok"}
+
+    # 不是文字（貼圖、圖片）
+    message = event.get("message", {})
+    if message.get("type") != "text":
+        return {"status": "ok"}
+
+    user_message = message.get("text")
+    user_id = event.get("source", {}).get("userId")
+
+    # 保護：沒有 key 就不要打 API
+    if not DIFY_API_KEY:
+        print("DIFY_API_KEY not set")
+        return {"status": "ok"}
 
     resp = requests.post(
         DIFY_API_URL,
@@ -28,12 +50,10 @@ async def line_webhook(request: Request):
             "query": user_message,
             "user": user_id,
             "response_mode": "blocking"
-        }
+        },
+        timeout=10
     )
 
-    dify_answer = resp.json().get("answer", "（沒有回應）")
+    print("Dify response:", resp.text)
 
-    # 這裡先 log，下一步才真的回 LINE
-    return {
-        "reply": dify_answer
-    }
+    return {"status": "ok"}
