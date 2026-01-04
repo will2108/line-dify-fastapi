@@ -4,15 +4,19 @@ import os
 import hmac
 import hashlib
 import base64
+import logging
 
 app = FastAPI()
+logging.basicConfig(level=logging.INFO)
 
+# -------------------------
+# Env
+# -------------------------
 DIFY_API_KEY = os.getenv("DIFY_API_KEY")
-DIFY_API_URL = "https://api.dify.ai/v1/chat-messages"
+DIFY_API_URL = "https://api.dify.ai/v1/chat-messages"  # ✅ Chat / Agent Assistant
 
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-
 LINE_REPLY_API = "https://api.line.me/v2/bot/message/reply"
 
 
@@ -21,18 +25,26 @@ def health():
     return {"status": "ok"}
 
 
-def verify_line_signature(body: bytes, signature: str | None):
-    if not signature:
+# -------------------------
+# LINE signature verify
+# -------------------------
+def verify_line_signature(body: bytes, signature: str | None) -> bool:
+    if not signature or not LINE_CHANNEL_SECRET:
         return False
-    hash = hmac.new(
+
+    mac = hmac.new(
         LINE_CHANNEL_SECRET.encode("utf-8"),
         body,
         hashlib.sha256
     ).digest()
-    expected = base64.b64encode(hash).decode()
+
+    expected = base64.b64encode(mac).decode()
     return hmac.compare_digest(expected, signature)
 
 
+# -------------------------
+# Webhook
+# -------------------------
 @app.post("/line/webhook")
 async def line_webhook(
     request: Request,
@@ -40,20 +52,17 @@ async def line_webhook(
 ):
     body = await request.body()
 
-    # 1️⃣ 驗證 LINE 簽章（Verify 會帶）
     if not verify_line_signature(body, x_line_signature):
-        # Verify 失敗 LINE 會顯示 NG
         raise HTTPException(status_code=403, detail="Invalid signature")
 
     payload = await request.json()
+    logging.info(f"📩 LINE payload: {payload}")
 
-    # 2️⃣ ⭐ 非常重要：LINE Verify / 系統事件，events 可能是空的
-    if "events" not in payload or len(payload["events"]) == 0:
-        return {"status": "ok"}  # 一定要 200
+    if not payload.get("events"):
+        return {"status": "ok"}
 
     event = payload["events"][0]
 
-    # 3️⃣ 只處理「文字訊息」
     if event.get("type") != "message":
         return {"status": "ok"}
 
@@ -65,27 +74,44 @@ async def line_webhook(
     reply_token = event["replyToken"]
     user_id = event["source"]["userId"]
 
-    # 4️⃣ 呼叫 Dify
-    dify_resp = requests.post(
-        DIFY_API_URL,
-        headers={
-            "Authorization": f"Bearer {DIFY_API_KEY}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "query": user_text,
-            "user": user_id,
-            "response_mode": "blocking"
-        },
-        timeout=30
-    )
+    logging.info(f"🗣 User: {user_text}")
 
-    if dify_resp.status_code != 200:
-        dify_answer = "（Dify API 錯誤）"
-    else:
-        dify_answer = dify_resp.json().get("answer", "（AI 沒有回應）")
+    # -------------------------
+    # Call Dify Chat / Agent
+    # -------------------------
+    dify_payload = {
+        "inputs": {},                # ✅ 必填，就算不用
+        "query": user_text,
+        "response_mode": "blocking",
+        "user": user_id
+    }
 
-    # 5️⃣ 回 LINE
+    try:
+        resp = requests.post(
+            DIFY_API_URL,
+            headers={
+                "Authorization": f"Bearer {DIFY_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json=dify_payload,
+            timeout=60
+        )
+
+        logging.info(f"🤖 Dify status: {resp.status_code}")
+        logging.info(f"🤖 Dify body: {resp.text}")
+
+        if resp.status_code != 200:
+            answer = "（Dify API 錯誤）"
+        else:
+            answer = resp.json().get("answer", "（AI 沒有回應）")
+
+    except Exception:
+        logging.exception("❌ Dify call failed")
+        answer = "（Dify 呼叫失敗）"
+
+    # -------------------------
+    # Reply to LINE
+    # -------------------------
     requests.post(
         LINE_REPLY_API,
         headers={
@@ -95,7 +121,7 @@ async def line_webhook(
         json={
             "replyToken": reply_token,
             "messages": [
-                {"type": "text", "text": dify_answer}
+                {"type": "text", "text": answer}
             ]
         }
     )
