@@ -61,7 +61,6 @@ SSE_TAIL_MAX = 80
 SSE_RAW: List[Dict[str, Any]] = []
 SSE_RAW_MAX = 50
 
-
 # =========================================================
 # Health / Debug
 # =========================================================
@@ -130,7 +129,6 @@ def _line_headers() -> Dict[str, str]:
 
 
 def _extract_push_to_id(source: Dict[str, Any]) -> str:
-    # user / group / room
     return source.get("userId") or source.get("groupId") or source.get("roomId") or ""
 
 
@@ -237,7 +235,6 @@ def _looks_bad_text(s: str) -> bool:
         return True
     if UUID_RE.match(s):
         return True
-    # looks like event_name (snake_case)
     if len(s) <= 30 and all((c.islower() or c == "_") for c in s) and "_" in s:
         return True
     return False
@@ -255,15 +252,8 @@ def _pick_answer_fields(d: Dict[str, Any]) -> List[str]:
 
 
 def _extract_answer(obj: Dict[str, Any]) -> str:
-    """
-    IMPORTANT:
-    Dify streaming 的 agent_message.answer 可能是一個字一個字吐，
-    所以不能用 len<=2 過濾，否則永遠收不到答案。
-    """
     event = (obj.get("event") or "").strip()
-    if event in IGNORE_EVENTS:
-        return ""
-    if event == "error":
+    if event in IGNORE_EVENTS or event == "error":
         return ""
 
     candidates: List[str] = []
@@ -276,7 +266,7 @@ def _extract_answer(obj: Dict[str, Any]) -> str:
     for s in candidates:
         if _looks_bad_text(s):
             continue
-        return s  # allow 1-char tokens
+        return s  # allow 1-char tokens (Dify may stream per-character)
     return ""
 
 
@@ -288,9 +278,8 @@ def _is_good_final_thought(obj: Dict[str, Any]) -> bool:
         return False
     if UUID_RE.match(thought):
         return False
-    # 如果 thought 是工具執行資訊，通常 tool 會有值；你貼的正常答案 tool=""
-    tool = (obj.get("tool") or "").strip()
-    if tool:
+    # tool thought 通常 tool 會有值；你的正常答案 tool=""
+    if (obj.get("tool") or "").strip():
         return False
     if len(thought) < 10:
         return False
@@ -331,6 +320,38 @@ def _parse_sse_block(lines: List[str], last_event_line: str) -> Tuple[Optional[D
         return (None, event_name)
 
 
+def _merge_stream_text(acc: str, chunk: str) -> str:
+    """
+    Make streaming robust:
+    - Supports per-character streaming
+    - Supports "full-so-far" streaming (chunk contains the whole accumulated text)
+    - Avoids duplicated overlaps
+    """
+    acc = acc or ""
+    chunk = (chunk or "")
+    if not chunk:
+        return acc
+
+    # If the server sometimes sends the full text so far
+    if len(chunk) > 2:
+        if chunk.startswith(acc):
+            return chunk
+        if acc.endswith(chunk):
+            return acc
+
+    # Overlap: suffix(acc) == prefix(chunk)
+    max_k = min(len(acc), len(chunk))
+    for k in range(max_k, 0, -1):
+        if acc.endswith(chunk[:k]):
+            return acc + chunk[k:]
+
+    # If chunk is fully contained somewhere (rare), ignore
+    if len(chunk) > 6 and chunk in acc:
+        return acc
+
+    return acc + chunk
+
+
 def dify_call_agent_streaming(query: str, user_id: str) -> str:
     if not DIFY_API_KEY:
         _sse_tail_add("config_error", note="DIFY_API_KEY missing")
@@ -346,7 +367,7 @@ def dify_call_agent_streaming(query: str, user_id: str) -> str:
     no_text_deadline = time.time() + NO_TOKEN_FALLBACK_SECONDS
     overall_deadline = time.time() + OVERALL_DEADLINE_SECONDS
 
-    parts: List[str] = []
+    acc = ""
     got_any_answer = False
     last_good_thought = ""
 
@@ -370,9 +391,7 @@ def dify_call_agent_streaming(query: str, user_id: str) -> str:
                 now = time.time()
 
                 if now > overall_deadline:
-                    final = "".join(parts).strip()
-                    if not final and last_good_thought:
-                        final = last_good_thought
+                    final = (last_good_thought or acc).strip()
                     _sse_tail_add("overall_timeout", got_any_answer=got_any_answer, text_len=len(final))
                     return _truncate_for_line(final) if final else BUSY_TEXT
 
@@ -397,29 +416,24 @@ def dify_call_agent_streaming(query: str, user_id: str) -> str:
                         if _is_good_final_thought(obj):
                             last_good_thought = (obj.get("thought") or "").strip()
 
-                        ans = _extract_answer(obj)
+                        chunk = _extract_answer(obj)
                         _sse_tail_add(
                             "event",
                             obj=obj,
-                            has_text=bool(ans),
-                            chunk_preview=(ans[:80] if ans else ""),
+                            has_text=bool(chunk),
+                            chunk_preview=(chunk[:80] if chunk else ""),
                         )
 
-                        if isinstance(event, str) and event in IGNORE_EVENTS:
-                            pass
-                        else:
-                            if ans:
-                                got_any_answer = True
-                                parts.append(ans)
+                        if isinstance(event, str) and event not in IGNORE_EVENTS and chunk:
+                            got_any_answer = True
+                            acc = _merge_stream_text(acc, chunk)
 
                         if isinstance(event, str) and event in END_EVENTS:
-                            final = "".join(parts).strip()
-                            if not final and last_good_thought:
-                                final = last_good_thought
+                            # ✅ 最終答案：優先用 agent_thought.thought（完整句），沒有才用 streaming 合併結果
+                            final = (last_good_thought or acc).strip()
                             _sse_tail_add("end", got_any_answer=got_any_answer, text_len=len(final))
                             return _truncate_for_line(final) if final else BUSY_TEXT
 
-                    # after block handled
                     if (not got_any_answer) and (now > no_text_deadline):
                         _sse_tail_add("no_text_timeout", note="no valid answer yet")
                         return BUSY_TEXT
@@ -439,14 +453,12 @@ def dify_call_agent_streaming(query: str, user_id: str) -> str:
                     _sse_raw_add(obj)
                     if _is_good_final_thought(obj):
                         last_good_thought = (obj.get("thought") or "").strip()
-                    ans = _extract_answer(obj)
-                    if ans:
+                    chunk = _extract_answer(obj)
+                    if chunk:
                         got_any_answer = True
-                        parts.append(ans)
+                        acc = _merge_stream_text(acc, chunk)
 
-            final = "".join(parts).strip()
-            if not final and last_good_thought:
-                final = last_good_thought
+            final = (last_good_thought or acc).strip()
             _sse_tail_add("eof", got_any_answer=got_any_answer, text_len=len(final))
             return _truncate_for_line(final) if final else BUSY_TEXT
 
@@ -570,13 +582,10 @@ def ey_news(payload: dict = Body(default={}), key: Optional[str] = Query(None)):
         r.raise_for_status()
 
         text = (r.text or "").strip()
-        if not text:
-            items = []
-        elif text.startswith("{") or text.startswith("["):
+        if text.startswith("{") or text.startswith("["):
             data = json.loads(text)
             items = data.get("data") or data.get("items") or []
         else:
-            logging.error("❌ EY News non-JSON response: %s", text[:200])
             items = []
     except Exception:
         logging.exception("❌ EY News API error")
@@ -589,7 +598,6 @@ def ey_news(payload: dict = Body(default={}), key: Optional[str] = Query(None)):
 def ey_policy(payload: dict = Body(default={}), key: Optional[str] = Query(None)):
     _check_tool_key(key)
     limit = int(payload.get("limit", 5))
-    # TODO: 之後接真資料 -> 換成 EY OpenData 對應 policy 端點
     return {
         "source": "行政院全球資訊網",
         "type": "政策",
@@ -603,7 +611,6 @@ def ey_policy(payload: dict = Body(default={}), key: Optional[str] = Query(None)
 def ey_consumer_warning(payload: dict = Body(default={}), key: Optional[str] = Query(None)):
     _check_tool_key(key)
     limit = int(payload.get("limit", 5))
-    # TODO: 之後接真資料 -> 換成 EY OpenData 對應 consumer warning 端點
     return {
         "source": "行政院全球資訊網",
         "type": "消費警示",
