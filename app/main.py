@@ -283,6 +283,13 @@ def _is_good_final_thought(obj: Dict[str, Any]) -> bool:
         return False
     if len(thought) < 10:
         return False
+    # ✅ 新增：像 JSON 的 thought 一律不要
+    t = thought.strip()
+    if (t.startswith("{") and t.endswith("}")) or (t.startswith("[") and t.endswith("]")):
+        return False
+    if '"role"' in t or '"tools"' in t or '"parameters"' in t:
+        return False
+    
     return True
 
 
@@ -391,7 +398,7 @@ def dify_call_agent_streaming(query: str, user_id: str) -> str:
                 now = time.time()
 
                 if now > overall_deadline:
-                    final = (last_good_thought or acc).strip()
+                    final = (acc or last_good_thought).strip()
                     _sse_tail_add("overall_timeout", got_any_answer=got_any_answer, text_len=len(final))
                     return _truncate_for_line(final) if final else BUSY_TEXT
 
@@ -430,7 +437,7 @@ def dify_call_agent_streaming(query: str, user_id: str) -> str:
 
                         if isinstance(event, str) and event in END_EVENTS:
                             # ✅ 最終答案：優先用 agent_thought.thought（完整句），沒有才用 streaming 合併結果
-                            final = (last_good_thought or acc).strip()
+                            final = (acc or last_good_thought).strip()
                             _sse_tail_add("end", got_any_answer=got_any_answer, text_len=len(final))
                             return _truncate_for_line(final) if final else BUSY_TEXT
 
@@ -458,7 +465,7 @@ def dify_call_agent_streaming(query: str, user_id: str) -> str:
                         got_any_answer = True
                         acc = _merge_stream_text(acc, chunk)
 
-            final = (last_good_thought or acc).strip()
+            final = (acc or last_good_thought).strip()
             _sse_tail_add("eof", got_any_answer=got_any_answer, text_len=len(final))
             return _truncate_for_line(final) if final else BUSY_TEXT
 
