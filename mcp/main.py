@@ -5,6 +5,11 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, Any
 
+MCP_BASE_URL = os.getenv("MCP_BASE_URL")
+
+MCP_COST_URL = f"{MCP_BASE_URL}/mcp/get_cost_projection"
+MCP_HEALTH_URL = f"{MCP_BASE_URL}/mcp/get_service_health"
+
 # =====================================================
 # App
 # =====================================================
