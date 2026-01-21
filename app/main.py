@@ -11,6 +11,11 @@ import requests
 import re
 from typing import Optional, Dict, Any, List, Tuple
 
+MCP_BASE_URL = os.getenv("MCP_BASE_URL")
+
+MCP_COST_URL = f"{MCP_BASE_URL}/mcp/get_cost_projection"
+MCP_HEALTH_URL = f"{MCP_BASE_URL}/mcp/get_service_health"
+
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
